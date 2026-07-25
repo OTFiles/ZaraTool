@@ -768,6 +768,26 @@ def inspect_user(session, mid):
     activity = analyze_activity(reply_items + dm_items)
     aleg_check = cross_check_allegiance(allegiance_raw, content, live_analyzed["liveAttitude"])
 
+    # ========== 生成 AI 样本（去重、三来源轮流取样） ==========
+    sample_groups = [
+        ("[留言]", [it["text"].strip() for it in reply_items]),
+        ("[弹幕]", [it["text"].strip() for it in dm_items]),
+        ("[直播]", [t.strip() for t in live_texts]),
+    ]
+    samples = []
+    seen_s = set()
+    idx = 0
+    while idx < max(len(g[1]) for g in sample_groups) and len(samples) < 120:
+        for tag, arr in sample_groups:
+            if idx < len(arr):
+                s = arr[idx]
+                if len(s) >= 2 and s not in seen_s:
+                    seen_s.add(s)
+                    samples.append(f"{tag} {s[:80]}")
+        idx += 1
+    video_titles = [v["title"] for v in videos if v.get("title")][:12]
+
+    # ========== 构建结果 ==========
     result = {
         "mid": mid,
         "card": card,
@@ -782,11 +802,13 @@ def inspect_user(session, mid):
         "followings": followings,
         "medals": medals,
         "commonFollow": common_follow,
+        "samples": samples,
+        "videoTitles": video_titles,
         "riskScore": None
     }
     result["riskScore"] = calc_risk_score(result)
-    
-    # ----- 保存原始数据到本地文件 -----
+
+    # ========== 保存原始数据到历史文件 ==========
     raw_data = {
         "mid": mid,
         "card": card,
@@ -799,8 +821,15 @@ def inspect_user(session, mid):
         "common_follow": common_follow
     }
     save_history(mid, raw_data)
-    # ---------------------------------
-    
+
+    # ========== 生成提示词并写入 prompt.txt ==========
+    prompt_text = generate_prompt(result)
+    try:
+        with open("prompt.txt", "w", encoding="utf-8") as f:
+            f.write(prompt_text)
+    except Exception as e:
+        print(f"⚠️ 写入 prompt.txt 失败: {e}")
+
     return result
 
 def save_history(mid, raw_data):
@@ -821,18 +850,20 @@ def save_history(mid, raw_data):
                 f.write(f"认证: {card['official']}\n")
             f.write("\n")
 
-            # 2. 评论区留言（最多50条）
+            # 2. 评论区留言（完整）
             replies = raw_data.get("replies", [])
-            f.write(f"[评论区留言] 共{len(replies)}条，显示前50条:\n")
-            for i, r in enumerate(replies[:50]):
+            f.write(f"[评论区留言] 共{len(replies)}条:\n")
+            for i, r in enumerate(replies):
                 text = r.get("text", "").replace("\n", " ")
-                f.write(f"  {i+1}. {text}\n")
+                oid = r.get("oid", "")
+                link = f" (av{oid})" if oid else ""
+                f.write(f"  {i+1}. {text}{link}\n")
             f.write("\n")
 
-            # 3. 视频弹幕（最多50条）
+            # 3. 视频弹幕（完整）
             danmaku = raw_data.get("danmaku", [])
-            f.write(f"[视频弹幕] 共{len(danmaku)}条，显示前50条:\n")
-            for i, d in enumerate(danmaku[:50]):
+            f.write(f"[视频弹幕] 共{len(danmaku)}条:\n")
+            for i, d in enumerate(danmaku):
                 text = d.get("text", "").replace("\n", " ")
                 f.write(f"  {i+1}. {text}\n")
             f.write("\n")
@@ -879,6 +910,73 @@ def save_history(mid, raw_data):
     except Exception as e:
         # 写入失败不影响主流程
         print(f"⚠️ 保存历史文件失败: {e}")
+        
+def generate_prompt(res):
+    """生成简体中文分析提示词，返回纯文本"""
+    ct = res.get('content', {})
+    circles = ct.get('circleSlices', [])[:8]
+    circles_str = "、".join(f"{k}:{v}" for k, v in circles)
+
+    camps = ct.get('campInfo', [])[:5]
+    camps_str = "；".join(
+        f"{c['camp']}(关注度{c['share']}%,态度{c['attitude']['label']}"
+        f"{c['attitude']['ratio'] if c['attitude']['ratio'] is not None else ''}%)"
+        for c in camps
+    )
+
+    aleg = res.get('allegiance', [])
+    aleg_str = "；".join(
+        f"{a['camp']}[{'/'.join(a['signals'])}→{a['consistency']}]"
+        for a in aleg
+    ) or "无"
+
+    live = res.get('live', {})
+    rooms = live.get('rooms', [])[:6]
+    rooms_str = "；".join(
+        f"{r['upname']}{'('+r['camp']+')' if r.get('camp') else ''}"
+        f"×{r['count']}条/敌对{r['hostileRatio']}%"
+        for r in rooms
+    ) or "无"
+
+    c = res.get('card', {})
+    features = [
+        f"UID={res['mid']} 等级{c.get('level',0)} 粉丝{c.get('fans',0)} 关注{c.get('following',0)} 投稿{c.get('archiveCount',0)}",
+        f"疑似小号可能性 {res['novice']['p']}%" if res.get('novice') else "",
+        f"留言总数 {res['replyTotal']}、弹幕 {res['danmakuTotal']}、直播弹幕 {live.get('total',0)}",
+        f"评论区加权引战比例 {ct.get('toxicRatio',0)}%（辱骂{ct.get('hardCount',0)}/硬对线{ct.get('memeCount',0)}/轻嘲讽{ct.get('lightCount',0)}，样本{ct.get('cmtSampleN',0)}条）",
+        f"直播弹幕引战比例 {ct.get('liveToxicRatio',0)}%（样本{ct.get('liveSampleN',0)}条）",
+        f"活跃圈子：{circles_str or '无'}",
+        f"阵营态度：{camps_str or '无'}",
+        f"认证归属：{aleg_str}",
+        f"直播动向：{rooms_str}",
+    ]
+    if res.get('reverseSuspect'):
+        features.append(f"规则标记：疑似反串({res['reverseSuspect']['level']})")
+    features = [f for f in features if f]
+
+    samples = res.get('samples', [])
+    samples_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(samples))
+    titles = res.get('videoTitles', [])[:12]
+    titles_text = "\n".join(f"· {t}" for t in titles)
+
+    system = (
+        "你是一个数据驱动的 B 站账号行为分析师，任务是用中文帮用户辨识“引战/带风向/反串”账号。\n"
+        "1. 结论必须有数据或原文支撑，禁止脑补性别/年龄/职业等。\n"
+        "2. 多引用具体数字或发言片段。\n"
+        "3. 区分“关注度”与“立场”：活跃≠站边，可能是反方或乐子人。\n"
+        "4. 特别注意反串：若认证支持某圈但在该圈发言敌对，指出矛盾。\n"
+        "5. 语气客观，不人身攻击，输出是参考讯号非定论。\n"
+        "6. 样本过少时直说“资料不足以判断”。\n"
+        "7. “加权引战比例”会漏掉无黑话的对线，请通读原文，即使比例低但原文好斗也应指出。\n"
+        "8. 全程使用简体中文。\n"
+        "格式：【立场/圈子】…\n【风格】…\n【引战或带风向倾向】…\n【反串或身份矛盾】…\n【可信度】高/中/低 + 理由\n【总结】一句话"
+    )
+    user = (
+        "【统计特征】\n" + "\n".join(features) +
+        "\n\n【近期活动影片标题】\n" + (titles_text or "无") +
+        "\n\n【发言原文样本(" + str(len(samples)) + "条)】\n" + (samples_text or "无")
+    )
+    return system + "\n\n" + user
 
 def print_report(res):
     c = res["card"]
