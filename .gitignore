@@ -3,5 +3,6 @@ node_modules/
 *.log
 .DS_Store
 *cookies*
+*cookie*
 bilibili.history.txt
 prompt.txt
